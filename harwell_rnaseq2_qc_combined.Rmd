@@ -1,0 +1,186 @@
+---
+  html_document:
+    toc: true
+    highlight: zenburn
+    theme: united
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(tidy=TRUE, highlight=TRUE, dev="png",
+               cache=FALSE, highlight=TRUE, autodep=TRUE, warning=FALSE, error=FALSE,
+               message=FALSE, prompt=TRUE, comment='', fig.cap='')
+```
+
+
+# Harwell RNA-Seq (Tbr2+) QC analysis
+
+```{r setup-report, echo=FALSE}
+ 
+# Setup report details
+clientname="Manuel Baizabal"
+clientemail="manuel_baizabal@hms.harvard.edu "
+lablocation="Harwell lab" 
+analystname="Meeta Mistry"
+analystemail="mmistry@hsph.harvard.edu"
+```
+
+RNA-Seq analysis for `r clientname` (`r clientemail`) at `r lablocation`. Contact `r analystname` (`r analystemail`) for additional details. Request from client was:     
+
+> RNA-seq experiments carried out on Tbr2+ cells (committed neuronal progenitors) and unlabeled "Neg" cells (i.e. cortical neurons).
+>
+> Description of sequencing datasets:		
+> 
+> *  8 samples per celltype (4WT and 4KO) were run in an entire sequencing flow cell with 2 lanes (HiSeq2500).
+> * Every biological replicate represents one pool of 2-5 embryonic brains collected from Prdm16 WT and KO mice in independent sorting experiments (sorts 3-6).
+> * Initial sequencing of Tbr2+ cells (FC_02013) resulted in fewer reads per lane than expected (around 87 M reads per lane). Therefore, **an additional sequencing lane was loaded with all 8 samples** in order to reach the desired 20-30 M reads per sample. 
+> * Initial sequencing of Neg cells (FC_02014) resulted in one sample taking a high proportion of the reads (i.e. WT_sort6 took around 46 M in each lane). Therefore, an additional sequencing lane was loaded with all but one sample (see below) in order to reach the desired 20-30 M reads per sample.   																
+> * The additional sequencing of Tbr2+ and Neg samples was combined in a new sequencing flow cell (FC_02022).													                          In the new flow cell (FC_02022), the WT_sort5 was actually excluded. This finding indicates that **WT_sort5 and WT_sort6 were switched at some point.** 
+>
+
+## QC analysis
+The sequencing data was analyzed independently for each run independently to see how samples clustered. **For each run we have generated a QC report which is linked below**:
+
+* [Initial run QC](https://dl.dropboxusercontent.com/u/35207958/harwell_prdm16/qc-summary-tbr2/qc-summary.html#Quality_control_metrics) (FC_02013 and FC_02014)
+* [Additional run QC](https://dl.dropboxusercontent.com/u/35207958/harwell_prdm16/qc-summary-extra/qc-summary.html#Quality_control_metrics) (FC_02022)
+
+To summarize, the initial report shows that the WT_sort6 samples have a significanty larger number of reads compared to all other samples, as expected. Sample WT_6 is a clear outlier based on the density distribution and boxplot of normalized counts. However, with the PCA plot and the Spearman correlation heatmap we observe samples to cluster as expected with the largest amout of variance being explained by differences in celltype (Tbr2+ vs. Neg) and then to some degree, differences based on genotype (WT vs. KO) for the Tbr2+ cells. For the additional run, again we observe outlier tendencies for sample WT_sort6 but samples cluster by celltype and to some extent by genotype. 
+
+For **this report, we will merge the quality information across both runs and assess whether the data clusters well enough based on the important biological factors (celltype and genotype). Also, this will help in evaluating possible batch effects**.
+
+
+## Setup
+### Bioconductor and R libraries used
+
+```{r load-libraries, echo=FALSE}
+library(ggplot2)
+library(reshape)
+library(gplots)
+library(edgeR)
+library(CHBUtils)
+library(pheatmap)
+library(DESeq2)
+```
+
+### Load data 
+```{r load-data}
+
+# Setup variables
+proj_summary1 = "/home/mistrm82/R/harwell_prdm16/meta/tbr2/project-summary.csv"
+counts_file1 = "/home/mistrm82/R/harwell_prdm16/data/tbr2/combined.counts"
+
+proj_summary2 = "/home/mistrm82/R/harwell_prdm16/meta/extra/project-summary.csv"
+counts_file2 = "/home/mistrm82/R/harwell_prdm16/data/extra/combined.counts"
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+"#0072B2", "#D55E00", "#CC79A7")
+
+# Load data
+summarydata1 = data.frame(read.table(proj_summary1, header=TRUE, sep=","), row.names="Name", check.rows=FALSE)
+summarydata2 = data.frame(read.table(proj_summary2, header=TRUE, sep=","), row.names="Name", check.rows=FALSE)
+summarydata2$flowcell = rep("FC_02022", 16)
+
+# Reorder and merge data
+summarydata2 <- summarydata2[,colnames(summarydata1)]
+summarydata <- rbind(summarydata1, summarydata2)
+summarydata <- summarydata[order(summarydata$flowcell),]
+
+# Add lane information
+summarydata$lane <- c(rep(1:2, 16), rep(3, 8), rep(4, 8))
+summarydata$shortname <- paste(summarydata$celltype, summarydata$genotype, summarydata$sort, summarydata$lane, sep="_")
+
+# Create metadata
+metadata <- data.frame(summarydata[,c('celltype', 'genotype', 'sort', 'flowcell', 'lane')], 
+                       row.names= summarydata$shortname)
+metadata$lane <- factor(metadata$lane)
+metadata$sort <- factor(metadata$sort)
+
+# Load counts
+counts1 = read.table(counts_file1, header=TRUE, row.names="id", check.names=FALSE)
+counts2 = read.table(counts_file2, header=TRUE, row.names="id", check.names=FALSE)
+
+# Order counts and merge
+counts1 <- counts1[,rownames(summarydata1)]
+counts2 <- counts2[,rownames(summarydata2)]
+counts <- cbind(counts1, counts2)
+colnames(counts) <- summarydata$shortname
+
+# Remove WT sample from additional run
+remove <- which(row.names(metadata) == "neg_WT_5_4")
+counts <- counts[,-remove]
+metadata <- metadata[-remove,]
+summarydata <- summarydata[-remove,]
+```
+
+## Boxplot of log10 counts per gene
+```{r boxplot-raw}
+
+melted = melt(counts)
+colnames(melted) = c("sample", "count")
+melted$sample = factor(melted$sample)
+melted = melted[order(melted$sample),]
+melted$count = log(melted$count)
+ggplot(melted, aes(x=sample, y=count)) + geom_boxplot() +
+    theme_bw(base_size=10) +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90)) + xlab("")
+```
+
+## Boxplot of log10 TMM-normalized counts per gene
+Trimmed mean of M-values (TMM) normalization is described
+[here](http://genomebiology.com/2010/11/3/R25)
+
+Robinson, M. D., & Oshlack, A. (2010). A scaling normalization method for differential expression analysis of RNA-seq data. Genome Biology, 11(3). doi:10.1186/gb-2010-11-3-r25
+
+```{r boxplot-normalized}
+y = DGEList(counts=counts)
+y = calcNormFactors(y)
+normalized_counts = cpm(y, normalized.lib.sizes=TRUE)
+melted = melt(normalized_counts)
+colnames(melted) = c("gene", "sample", "count")
+melted$sample = factor(melted$sample)
+melted = melted[order(melted$sample),]
+melted$count = log(melted$count)
+ggplot(melted, aes(x=sample, y=count)) + geom_boxplot() +
+    theme_bw(base_size=10) +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90)) + xlab("")
+```
+
+
+## Density of log10 TMM-normalized counts
+```{r density-normalized}
+ggplot(melted, aes(x=count, group=sample)) +
+    geom_density() +
+    theme_bw(base_size=10) +
+    theme(panel.grid.major = element_line(size = .5, color = "grey"),
+          axis.text.x = element_text(angle=90)) + xlab("")
+```
+
+
+## Correlation (Pearson) heatmap of TMM-normalized counts
+```{r correlation-heatmap1, fig.align='center', fig.height=20, fig.width=20 }
+# Heatmap of sample-to-sample correlation matrix
+annotation <- metadata
+
+pheatmap(cor(normalized_counts, method = "pearson"), annotation=annotation,
+         fontsize = 12, fontsize_row = 12, height=50, width=50)
+```
+
+## Correlation (Spearman) heatmap of TMM-normalized counts
+```{r correlation-heatmap2, fig.align='center', fig.height=20, fig.width=20 }
+# Heatmap of sample-to-sample correlation matrix
+pheatmap(cor(normalized_counts, method = "spearman"), annotation=annotation,
+         fontsize = 12, fontsize_row = 12, height=50, width=50)
+```
+
+## PCA plot: genotype + celltype 
+```{r pca, eval=ncol(counts) > 1, fig.align='center'}
+dds = DESeqDataSetFromMatrix(countData=counts, colData=summarydata, design=~shortname)
+vst = varianceStabilizingTransformation(dds)
+plotPCA(vst, intgroup=c("celltype", "genotype"),  ntop=nrow(counts))
+```
+
+## PCA plot: flowcell 
+```{r pca2, eval=ncol(counts) > 1, fig.align='center' }
+plotPCA(vst, intgroup=c("flowcell"),  ntop=nrow(counts))
+```
